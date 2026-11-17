@@ -4,7 +4,9 @@ Checks BookMyShow every N minutes for new Bengaluru theatres going live
 for Avengers: Doomsday on December 17, 2026.
 Sends email alert when a new theatre is detected.
 
-Uses Playwright (headless Chromium) to bypass Cloudflare protection.
+Uses a Cloudflare Worker proxy to bypass BMS's Cloudflare WAF.
+The Worker runs on Cloudflare's own edge, so BMS doesn't block it.
+Set BMS_WORKER_URL in GitHub secrets to your Worker's URL.
 """
 
 import os
@@ -14,11 +16,13 @@ import smtplib
 import logging
 import re
 import hashlib
+import urllib.parse
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
+import requests
 from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -33,6 +37,13 @@ POLL_INTERVAL = 600
 # State file — persists known theatres between runs
 STATE_FILE = Path(__file__).parent / "known_theatres.json"
 LOG_FILE   = Path(__file__).parent / "tracker.log"
+
+# ─── CLOUDFLARE WORKER PROXY ─────────────────────────────────────────────────
+# Set BMS_WORKER_URL as a GitHub secret — e.g.
+#   https://bms-proxy.YOUR-SUBDOMAIN.workers.dev
+# Optionally set BMS_WORKER_TOKEN if you added SECRET_TOKEN to the Worker.
+WORKER_URL   = os.getenv("BMS_WORKER_URL",   "")
+WORKER_TOKEN = os.getenv("BMS_WORKER_TOKEN", "")
 
 # ─── EMAIL CONFIG  (edit these or set as env vars) ────────────────────────────
 EMAIL_SENDER   = os.getenv("BMS_EMAIL_SENDER",   "your_gmail@gmail.com")
@@ -53,81 +64,50 @@ logging.basicConfig(
 log = logging.getLogger("bms_tracker")
 
 
-# ─── PLAYWRIGHT FETCH ─────────────────────────────────────────────────────────
+# ─── CLOUDFLARE WORKER FETCH ──────────────────────────────────────────────────
 
-def fetch_html(url: str, retries: int = 3, wait_seconds: float = 4.0) -> str | None:
+def fetch_html(url: str, retries: int = 3, wait_seconds: float = 0) -> str | None:
     """
-    Fetch a URL using Playwright (headless Chromium).
-    Bypasses Cloudflare — renders the page like a real browser.
+    Fetch a BMS URL via our Cloudflare Worker proxy.
+    The Worker runs on Cloudflare's own edge, bypassing BMS's IP-level WAF block.
     Returns HTML text or None on failure.
     """
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
-    try:
-        from playwright_stealth import stealth_sync
-        _stealth_fn = stealth_sync
-    except ImportError:
-        from playwright_stealth import Stealth
-        _stealth_fn = Stealth().apply_stealth_sync
+    if not WORKER_URL:
+        log.error(
+            "BMS_WORKER_URL is not set. "
+            "Deploy cloudflare_worker.js and add the URL as a GitHub secret."
+        )
+        return None
+
+    # Build the proxy request URL
+    params = {"url": url}
+    if WORKER_TOKEN:
+        params["token"] = WORKER_TOKEN
+    proxy_url = WORKER_URL.rstrip("/") + "/?" + urllib.parse.urlencode(params)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+    }
 
     for attempt in range(1, retries + 1):
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 800},
-                    locale="en-IN",
-                    timezone_id="Asia/Kolkata",
-                    extra_http_headers={
-                        "Accept-Language": "en-IN,en;q=0.9",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "DNT": "1",
-                    },
-                )
+            resp = requests.get(proxy_url, headers=headers, timeout=20)
+            proxied_status = int(resp.headers.get("X-Proxied-Status", resp.status_code))
 
-                page = context.new_page()
+            if proxied_status == 200:
+                log.info("Fetched %s via Worker (status 200, %d bytes)", url, len(resp.text))
+                return resp.text
+            else:
+                log.warning("Worker returned HTTP %s for %s (attempt %d)", proxied_status, url, attempt)
 
-                # Apply stealth patches — hides ~20 Cloudflare bot-detection vectors
-                _stealth_fn(page)
-
-                # First visit the homepage to get Cloudflare cookies
-                try:
-                    page.goto("https://in.bookmyshow.com/", timeout=25000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)
-                except PWTimeoutError:
-                    pass  # Homepage timeout is fine, we just need cookies
-
-                # Now fetch the actual target URL
-                response = page.goto(url, timeout=30000, wait_until="domcontentloaded")
-
-                if response and response.status == 200:
-                    # Wait for JS to populate __INITIAL_STATE__
-                    page.wait_for_timeout(int(wait_seconds * 1000))
-                    html = page.content()
-                    browser.close()
-                    log.info("Fetched %s (status 200, %d bytes)", url, len(html))
-                    return html
-                else:
-                    status = response.status if response else "no response"
-                    log.warning("HTTP %s for %s (attempt %d)", status, url, attempt)
-                    browser.close()
-
-        except PWTimeoutError:
-            log.warning("Timeout fetching %s (attempt %d)", url, attempt)
-        except Exception as exc:
-            log.warning("Playwright error for %s: %s (attempt %d)", url, exc, attempt)
+        except requests.RequestException as exc:
+            log.warning("Request error for %s: %s (attempt %d)", url, exc, attempt)
 
         if attempt < retries:
             sleep_time = 5.0 * attempt

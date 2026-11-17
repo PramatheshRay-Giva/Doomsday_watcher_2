@@ -22,14 +22,13 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
-
       - name: Run tracker (single scan)
         env:
-          BMS_EMAIL_SENDER:   ${{ secrets.BMS_EMAIL_SENDER }}
-          BMS_EMAIL_PASSWORD: ${{ secrets.BMS_EMAIL_PASSWORD }}
-          BMS_EMAIL_TO:       ${{ secrets.BMS_EMAIL_TO }}
+          BMS_EMAIL_SENDER:    ${{ secrets.BMS_EMAIL_SENDER }}
+          BMS_EMAIL_PASSWORD:  ${{ secrets.BMS_EMAIL_PASSWORD }}
+          BMS_EMAIL_TO:        ${{ secrets.BMS_EMAIL_TO }}
+          BMS_WORKER_URL:      ${{ secrets.BMS_WORKER_URL }}
+          BMS_WORKER_TOKEN:    ${{ secrets.BMS_WORKER_TOKEN }}
         run: python tracker.py --once
 
       - name: Save state back to repo
