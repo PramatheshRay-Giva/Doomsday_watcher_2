@@ -3,6 +3,8 @@ BMS Avengers Doomsday Theatre Tracker
 Checks BookMyShow every N minutes for new Bengaluru theatres going live
 for Avengers: Doomsday on December 17, 2026.
 Sends email alert when a new theatre is detected.
+
+Uses Playwright (headless Chromium) to bypass Cloudflare protection.
 """
 
 import os
@@ -17,7 +19,6 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
-import requests
 from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -40,26 +41,6 @@ EMAIL_TO       = os.getenv("BMS_EMAIL_TO",       "your_email@gmail.com")
 SMTP_HOST      = os.getenv("BMS_SMTP_HOST",      "smtp.gmail.com")
 SMTP_PORT      = int(os.getenv("BMS_SMTP_PORT",  "587"))
 
-# ─── REQUEST HEADERS ──────────────────────────────────────────────────────────
-# BMS sits behind Cloudflare. A realistic browser UA + headers avoids 403s.
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://in.bookmyshow.com/",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +51,89 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("bms_tracker")
+
+
+# ─── PLAYWRIGHT FETCH ─────────────────────────────────────────────────────────
+
+def fetch_html(url: str, retries: int = 3, wait_seconds: float = 4.0) -> str | None:
+    """
+    Fetch a URL using Playwright (headless Chromium).
+    Bypasses Cloudflare — renders the page like a real browser.
+    Returns HTML text or None on failure.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+    for attempt in range(1, retries + 1):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                    locale="en-IN",
+                    timezone_id="Asia/Kolkata",
+                    extra_http_headers={
+                        "Accept-Language": "en-IN,en;q=0.9",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "DNT": "1",
+                    },
+                )
+                # Hide webdriver fingerprint
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-IN', 'en']});
+                    window.chrome = { runtime: {} };
+                """)
+
+                page = context.new_page()
+
+                # First visit the homepage to get cookies (Cloudflare warmup)
+                try:
+                    page.goto("https://in.bookmyshow.com/", timeout=20000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                except PWTimeoutError:
+                    pass  # Homepage timeout is fine, we just need cookies
+
+                # Now fetch the actual target URL
+                response = page.goto(url, timeout=30000, wait_until="domcontentloaded")
+
+                if response and response.status == 200:
+                    # Wait for JS to populate __INITIAL_STATE__
+                    page.wait_for_timeout(int(wait_seconds * 1000))
+                    html = page.content()
+                    browser.close()
+                    log.info("Fetched %s (status 200, %d bytes)", url, len(html))
+                    return html
+                else:
+                    status = response.status if response else "no response"
+                    log.warning("HTTP %s for %s (attempt %d)", status, url, attempt)
+                    browser.close()
+
+        except PWTimeoutError:
+            log.warning("Timeout fetching %s (attempt %d)", url, attempt)
+        except Exception as exc:
+            log.warning("Playwright error for %s: %s (attempt %d)", url, exc, attempt)
+
+        if attempt < retries:
+            sleep_time = 5.0 * attempt
+            log.info("Retrying in %.0fs...", sleep_time)
+            time.sleep(sleep_time)
+
+    log.error("All %d attempts failed for %s", retries, url)
+    return None
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -114,24 +178,10 @@ def extract_initial_state(html: str) -> dict:
         return {}
 
 
-def fetch_html(url: str, retries: int = 3, backoff: float = 5.0) -> str | None:
-    """GET a URL, return HTML text or None on failure."""
-    for attempt in range(1, retries + 1):
-        try:
-            resp = SESSION.get(url, timeout=30, allow_redirects=True)
-            if resp.status_code == 200:
-                return resp.text
-            log.warning("HTTP %s for %s (attempt %d)", resp.status_code, url, attempt)
-        except requests.RequestException as exc:
-            log.warning("Request error for %s: %s (attempt %d)", url, exc, attempt)
-        time.sleep(backoff * attempt)
-    return None
-
-
 def get_all_venues() -> list[dict]:
     """
     Fetch the Bengaluru cinemas listing page and extract venue list.
-    Returns list of dicts: {VenueCode, VenueName, VenueAddress}
+    Returns list of dicts: {code, name, address}
     """
     url  = f"https://in.bookmyshow.com/{CITY}/cinemas"
     html = fetch_html(url)
@@ -148,7 +198,6 @@ def get_all_venues() -> list[dict]:
             .get("fetchVenuesListingApi", {})
             .get("queries", {})
         )
-        # There's usually one key in queries
         venues_raw = []
         for key, val in queries.items():
             venues_raw = val.get("data", {}).get("venues", [])
@@ -164,7 +213,6 @@ def get_all_venues() -> list[dict]:
         venues_raw = []
         for a in soup.select("a[href*='/buytickets/']"):
             href = a.get("href", "")
-            # extract venue code from URL like /cinemas/bengaluru/pvr.../buytickets/PVFF/...
             m = re.search(r"/buytickets/([A-Z0-9]+)/", href)
             if m:
                 venues_raw.append({
@@ -228,8 +276,6 @@ def get_showtimes_for_venue(venue_code: str) -> list[dict]:
 
     shows = []
 
-    # data.ShowDatesArray contains the date list; we care about data.ShowDetails
-    # or data.shows depending on BMS version.
     show_details = (
         data.get("ShowDetails")
         or data.get("shows")
@@ -240,13 +286,11 @@ def get_showtimes_for_venue(venue_code: str) -> list[dict]:
     for show in show_details:
         event_code  = show.get("EventCode", "")
         event_title = show.get("EventTitle") or show.get("eventTitle") or ""
-        # Match by keyword in title or event code
         if (
             MOVIE_KEYWORD.replace("-", " ").lower() in event_title.lower()
             or "avengers" in event_title.lower()
             or "doomsday" in event_title.lower()
         ):
-            # Collect showtime info
             show_times = show.get("ShowTimes") or show.get("showTimes") or []
             shows.append({
                 "event_code":  event_code,
@@ -262,12 +306,9 @@ def check_via_search_url() -> dict[str, dict]:
     Alternative: hit BMS's movie-specific listing for Bengaluru directly.
     Returns dict keyed by venue_code → {name, address, shows}
     """
-    # BMS search / movie page for the specific movie in bengaluru
-    # We try multiple URL patterns as BMS may assign different slugs
     candidate_urls = [
         f"https://in.bookmyshow.com/{CITY}/movies/avengers-doomsday/ET00",
         f"https://in.bookmyshow.com/{CITY}/movies/avengers-doomsday",
-        # Broad movie search page
         f"https://in.bookmyshow.com/{CITY}/movies?category=MV",
     ]
 
@@ -282,9 +323,7 @@ def check_via_search_url() -> dict[str, dict]:
         if not state:
             continue
 
-        # Look for venue/showtime combos anywhere in the state tree
         raw_json = json.dumps(state)
-        # Find all VenueCode patterns
         codes = re.findall(r'"VenueCode"\s*:\s*"([A-Z0-9]{3,6})"', raw_json)
         names = re.findall(r'"VenueName"\s*:\s*"([^"]+)"', raw_json)
 
@@ -326,7 +365,6 @@ def send_email(new_venues: list[dict]) -> None:
         f"Avengers: Doomsday Dec 17 — Bengaluru"
     )
 
-    # Build HTML body
     rows = ""
     for v in new_venues:
         name    = v.get("name", "Unknown")
@@ -412,7 +450,6 @@ def scan_for_doomsday_theatres() -> dict[str, dict]:
     all_venues = get_all_venues()
 
     if not all_venues:
-        # Fallback: try movie-specific search page
         log.info("Venue list empty — trying movie search URL fallback.")
         search_venues = check_via_search_url()
         for code, info in search_venues.items():
@@ -436,8 +473,8 @@ def scan_for_doomsday_theatres() -> dict[str, dict]:
                 "shows":   shows,
             }
 
-        # Polite delay between requests — avoid rate limiting
-        time.sleep(1.5)
+        # Polite delay between requests
+        time.sleep(2.0)
 
     return live_venues
 
@@ -448,6 +485,7 @@ def main(once: bool = False) -> None:
     log.info("=" * 60)
     log.info("BMS Avengers Doomsday Tracker started.")
     log.info("Target: Bengaluru / Dec 17 2026")
+    log.info("Fetch method: Playwright (headless Chromium)")
     log.info("Poll interval: %ds", POLL_INTERVAL)
     log.info("Alert email → %s", EMAIL_TO)
     log.info("=" * 60)
@@ -465,7 +503,6 @@ def main(once: bool = False) -> None:
 
         known = state.get("known_venues", {})
 
-        # Find genuinely new theatres
         new_venues = []
         for code, info in live.items():
             if code not in known:
@@ -474,7 +511,6 @@ def main(once: bool = False) -> None:
 
         if new_venues:
             send_email(new_venues)
-            # Update state
             for v in new_venues:
                 known[v["code"]] = {
                     "name":        v["name"],
