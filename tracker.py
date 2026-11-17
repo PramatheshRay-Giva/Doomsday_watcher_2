@@ -62,6 +62,7 @@ def fetch_html(url: str, retries: int = 3, wait_seconds: float = 4.0) -> str | N
     Returns HTML text or None on failure.
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+    from playwright_stealth import stealth_sync
 
     for attempt in range(1, retries + 1):
         try:
@@ -90,20 +91,16 @@ def fetch_html(url: str, retries: int = 3, wait_seconds: float = 4.0) -> str | N
                         "DNT": "1",
                     },
                 )
-                # Hide webdriver fingerprint
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-IN', 'en']});
-                    window.chrome = { runtime: {} };
-                """)
 
                 page = context.new_page()
 
-                # First visit the homepage to get cookies (Cloudflare warmup)
+                # Apply stealth patches — hides ~20 Cloudflare bot-detection vectors
+                stealth_sync(page)
+
+                # First visit the homepage to get Cloudflare cookies
                 try:
-                    page.goto("https://in.bookmyshow.com/", timeout=20000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(1500)
+                    page.goto("https://in.bookmyshow.com/", timeout=25000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)
                 except PWTimeoutError:
                     pass  # Homepage timeout is fine, we just need cookies
 
