@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      debug_html:
+        description: "Dump raw HTML state structure for debugging (yes/no)"
+        required: false
+        default: "no"
 
 jobs:
   watch:
@@ -28,7 +33,12 @@ jobs:
           BMS_EMAIL_PASSWORD:  ${{ secrets.BMS_EMAIL_PASSWORD }}
           BMS_EMAIL_TO:        ${{ secrets.BMS_EMAIL_TO }}
           SCRAPERAPI_KEY:      ${{ secrets.SCRAPERAPI_KEY }}
-        run: python tracker.py --once
+        run: |
+          if [ "${{ github.event.inputs.debug_html }}" = "yes" ]; then
+            python tracker.py --debug-html
+          else
+            python tracker.py --once
+          fi
 
       - name: Save state back to repo
         run: |

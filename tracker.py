@@ -463,7 +463,7 @@ def main(once: bool = False) -> None:
     log.info("=" * 60)
     log.info("BMS Avengers Doomsday Tracker started.")
     log.info("Target: Bengaluru / Dec 17 2026")
-    log.info("Fetch method: Playwright (headless Chromium)")
+    log.info("Fetch method: ScraperAPI (residential IP rotation)")
     log.info("Poll interval: %ds", POLL_INTERVAL)
     log.info("Alert email → %s", EMAIL_TO)
     log.info("=" * 60)
@@ -509,6 +509,35 @@ def main(once: bool = False) -> None:
         time.sleep(POLL_INTERVAL)
 
 
+def debug_html() -> None:
+    """
+    Fetch the cinemas page + movie URL via ScraperAPI and print the top-level
+    __INITIAL_STATE__ keys so we can identify the correct data path.
+    """
+    urls = [
+        f"https://in.bookmyshow.com/{CITY}/cinemas",
+        f"https://in.bookmyshow.com/{CITY}/movies/avengers-doomsday/ET00",
+    ]
+    for url in urls:
+        log.info("── Debugging: %s", url)
+        html = fetch_html(url)
+        if not html:
+            log.error("  Fetch failed.")
+            continue
+        log.info("  Fetched %d bytes", len(html))
+
+        state = extract_initial_state(html)
+        if not state:
+            log.warning("  No __INITIAL_STATE__ found — dumping first 2000 chars of HTML:")
+            print(html[:2000])
+        else:
+            log.info("  Top-level state keys: %s", list(state.keys()))
+            # Print the full state JSON (truncated to 8KB) for inspection
+            snippet = json.dumps(state, indent=2)[:8000]
+            print(snippet)
+        print()
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -517,5 +546,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Run a single scan then exit (used by CI/GitHub Actions).",
     )
+    parser.add_argument(
+        "--debug-html",
+        action="store_true",
+        help="Fetch pages via ScraperAPI and dump state structure for debugging.",
+    )
     args = parser.parse_args()
-    main(once=args.once)
+    if args.debug_html:
+        debug_html()
+    else:
+        main(once=args.once)
