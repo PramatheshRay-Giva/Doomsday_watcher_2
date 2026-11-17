@@ -4,9 +4,8 @@ Checks BookMyShow every N minutes for new Bengaluru theatres going live
 for Avengers: Doomsday on December 17, 2026.
 Sends email alert when a new theatre is detected.
 
-Uses a Cloudflare Worker proxy to bypass BMS's Cloudflare WAF.
-The Worker runs on Cloudflare's own edge, so BMS doesn't block it.
-Set BMS_WORKER_URL in GitHub secrets to your Worker's URL.
+Uses ScraperAPI to bypass BMS's Cloudflare WAF.
+Set SCRAPER_API_KEY in GitHub secrets (get free key at scraperapi.com).
 """
 
 import os
@@ -16,7 +15,6 @@ import smtplib
 import logging
 import re
 import hashlib
-import urllib.parse
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -38,12 +36,10 @@ POLL_INTERVAL = 600
 STATE_FILE = Path(__file__).parent / "known_theatres.json"
 LOG_FILE   = Path(__file__).parent / "tracker.log"
 
-# ─── CLOUDFLARE WORKER PROXY ─────────────────────────────────────────────────
-# Set BMS_WORKER_URL as a GitHub secret — e.g.
-#   https://bms-proxy.YOUR-SUBDOMAIN.workers.dev
-# Optionally set BMS_WORKER_TOKEN if you added SECRET_TOKEN to the Worker.
-WORKER_URL   = os.getenv("BMS_WORKER_URL",   "")
-WORKER_TOKEN = os.getenv("BMS_WORKER_TOKEN", "")
+# ─── SCRAPERAPI CONFIG ────────────────────────────────────────────────────────
+# Sign up free at https://scraperapi.com (1,000 req/month on free tier).
+# Add your API key as a GitHub secret named SCRAPERAPI_KEY.
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
 
 # ─── EMAIL CONFIG  (edit these or set as env vars) ────────────────────────────
 EMAIL_SENDER   = os.getenv("BMS_EMAIL_SENDER",   "your_gmail@gmail.com")
@@ -64,47 +60,47 @@ logging.basicConfig(
 log = logging.getLogger("bms_tracker")
 
 
-# ─── CLOUDFLARE WORKER FETCH ──────────────────────────────────────────────────
+# ─── SCRAPERAPI FETCH ─────────────────────────────────────────────────────────
 
 def fetch_html(url: str, retries: int = 3, wait_seconds: float = 0) -> str | None:
     """
-    Fetch a BMS URL via our Cloudflare Worker proxy.
-    The Worker runs on Cloudflare's own edge, bypassing BMS's IP-level WAF block.
+    Fetch a BMS URL via ScraperAPI, which uses residential IP rotation to
+    bypass BMS's Cloudflare WAF block on datacenter IPs.
     Returns HTML text or None on failure.
     """
-    if not WORKER_URL:
+    if not SCRAPERAPI_KEY:
         log.error(
-            "BMS_WORKER_URL is not set. "
-            "Deploy cloudflare_worker.js and add the URL as a GitHub secret."
+            "SCRAPERAPI_KEY is not set. "
+            "Sign up free at https://scraperapi.com and add the key as a GitHub secret."
         )
         return None
 
-    # Build the proxy request URL
-    params = {"url": url}
-    if WORKER_TOKEN:
-        params["token"] = WORKER_TOKEN
-    proxy_url = WORKER_URL.rstrip("/") + "/?" + urllib.parse.urlencode(params)
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
+    # ScraperAPI simple GET: pass target URL as a query param
+    proxy_url = "http://api.scraperapi.com"
+    params = {
+        "api_key": SCRAPERAPI_KEY,
+        "url": url,
+        "render": "false",          # no JS rendering needed; BMS inlines data in HTML
+        "country_code": "in",       # Indian residential IP — matches BMS geo-targeting
     }
 
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(proxy_url, headers=headers, timeout=20)
-            proxied_status = int(resp.headers.get("X-Proxied-Status", resp.status_code))
+            resp = requests.get(proxy_url, params=params, timeout=60)
 
-            if proxied_status == 200:
-                log.info("Fetched %s via Worker (status 200, %d bytes)", url, len(resp.text))
+            if resp.status_code == 200:
+                log.info("Fetched %s via ScraperAPI (status 200, %d bytes)", url, len(resp.text))
                 return resp.text
+            elif resp.status_code == 403:
+                log.warning("ScraperAPI returned HTTP 403 for %s (attempt %d) — target still blocking", url, attempt)
+            elif resp.status_code == 404:
+                # ScraperAPI returns 404 when the target URL itself is 404
+                log.warning("ScraperAPI returned HTTP 404 for %s — page not found", url)
+                return None
+            elif resp.status_code == 500:
+                log.warning("ScraperAPI internal error for %s (attempt %d)", url, attempt)
             else:
-                log.warning("Worker returned HTTP %s for %s (attempt %d)", proxied_status, url, attempt)
+                log.warning("ScraperAPI returned HTTP %s for %s (attempt %d)", resp.status_code, url, attempt)
 
         except requests.RequestException as exc:
             log.warning("Request error for %s: %s (attempt %d)", url, exc, attempt)

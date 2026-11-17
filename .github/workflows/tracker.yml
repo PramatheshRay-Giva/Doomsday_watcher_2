@@ -27,8 +27,7 @@ jobs:
           BMS_EMAIL_SENDER:    ${{ secrets.BMS_EMAIL_SENDER }}
           BMS_EMAIL_PASSWORD:  ${{ secrets.BMS_EMAIL_PASSWORD }}
           BMS_EMAIL_TO:        ${{ secrets.BMS_EMAIL_TO }}
-          BMS_WORKER_URL:      ${{ secrets.BMS_WORKER_URL }}
-          BMS_WORKER_TOKEN:    ${{ secrets.BMS_WORKER_TOKEN }}
+          SCRAPERAPI_KEY:      ${{ secrets.SCRAPERAPI_KEY }}
         run: python tracker.py --once
 
       - name: Save state back to repo
