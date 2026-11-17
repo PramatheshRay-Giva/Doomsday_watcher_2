@@ -62,7 +62,12 @@ def fetch_html(url: str, retries: int = 3, wait_seconds: float = 4.0) -> str | N
     Returns HTML text or None on failure.
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
-    from playwright_stealth import stealth_sync
+    try:
+        from playwright_stealth import stealth_sync
+        _stealth_fn = stealth_sync
+    except ImportError:
+        from playwright_stealth import Stealth
+        _stealth_fn = Stealth().apply_stealth_sync
 
     for attempt in range(1, retries + 1):
         try:
@@ -95,7 +100,7 @@ def fetch_html(url: str, retries: int = 3, wait_seconds: float = 4.0) -> str | N
                 page = context.new_page()
 
                 # Apply stealth patches — hides ~20 Cloudflare bot-detection vectors
-                stealth_sync(page)
+                _stealth_fn(page)
 
                 # First visit the homepage to get Cloudflare cookies
                 try:
